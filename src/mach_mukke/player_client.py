@@ -12,6 +12,12 @@ MPD_MUSIC_DIR = Path.home() / "Music"
 POLL_INTERVAL = 30
 
 
+def load_known_files() -> set[str]:
+    if not MUSIC_DIR.exists():
+        return set()
+    return {f.name for f in MUSIC_DIR.iterdir() if f.is_file()}
+
+
 async def poll_new_downloads(
     client: httpx.AsyncClient, known_files: set[str]
 ) -> list[str]:
@@ -124,7 +130,8 @@ async def main_loop():
         return
 
     headers = {"X-API-Key": API_KEY}
-    known_files: set[str] = set()
+    known_files: set[str] = load_known_files()
+    print(f"Already known {len(known_files)} files from {MUSIC_DIR}")
 
     async with httpx.AsyncClient(base_url=SERVER_URL, timeout=60.0) as client:
         print(f"Connecting to {SERVER_URL} for new music...")
