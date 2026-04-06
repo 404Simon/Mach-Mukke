@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -8,7 +9,7 @@ SERVER_URL = os.environ.get("MACH_MUKKE_SERVER_URL", "http://localhost:8000")
 API_KEY = os.environ.get("MACH_MUKKE_API_KEY", "")
 MUSIC_DIR = Path.home() / "Music" / "mach_mukke"
 MPD_MUSIC_DIR = Path.home() / "Music"
-POLL_INTERVAL = 5
+POLL_INTERVAL = 30
 
 
 async def poll_new_downloads(
@@ -69,6 +70,54 @@ async def add_to_rmpc(filepath: Path) -> None:
         print(f"Added to rmpc queue: {relative_path}")
 
 
+async def sse_listener(client: httpx.AsyncClient, known_files: set[str]):
+    while True:
+        try:
+            async with client.stream(
+                "GET",
+                "/api/sse",
+                headers={"X-API-Key": API_KEY},
+                timeout=None,
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if line.startswith("data: "):
+                        data = json.loads(line[6:])
+                        if data.get("event") == "download_complete":
+                            filename = data.get("filename")
+                            if filename and filename not in known_files:
+                                print(f"Downloading (SSE): {filename}")
+                                try:
+                                    filepath = await download_file(client, filename)
+                                    known_files.add(filename)
+                                    await add_to_rmpc(filepath)
+                                except Exception as e:
+                                    print(f"Failed to download {filename}: {e}")
+        except (httpx.RequestError, asyncio.CancelledError):
+            print("SSE connection lost, will retry...")
+            await asyncio.sleep(5)
+
+
+async def poll_fallback(client: httpx.AsyncClient, known_files: set[str]):
+    while True:
+        try:
+            new_files = await poll_new_downloads(client, known_files)
+            for filename in new_files:
+                print(f"Downloading (poll): {filename}")
+                try:
+                    filepath = await download_file(client, filename)
+                    known_files.add(filename)
+                    await add_to_rmpc(filepath)
+                except Exception as e:
+                    print(f"Failed to download {filename}: {e}")
+        except httpx.RequestError as e:
+            print(f"Connection error: {e}")
+        except Exception as e:
+            print(f"Error: {e}")
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
 async def main_loop():
     if not API_KEY:
         print("Error: MACH_MUKKE_API_KEY environment variable is required")
@@ -78,28 +127,17 @@ async def main_loop():
     known_files: set[str] = set()
 
     async with httpx.AsyncClient(base_url=SERVER_URL, timeout=60.0) as client:
-        print(f"Polling {SERVER_URL} for new music...")
+        print(f"Connecting to {SERVER_URL} for new music...")
         print(f"Music directory: {MUSIC_DIR}")
 
-        while True:
-            try:
-                new_files = await poll_new_downloads(client, known_files)
+        sse_task = asyncio.create_task(sse_listener(client, known_files))
+        poll_task = asyncio.create_task(poll_fallback(client, known_files))
 
-                for filename in new_files:
-                    print(f"Downloading: {filename}")
-                    try:
-                        filepath = await download_file(client, filename)
-                        known_files.add(filename)
-                        await add_to_rmpc(filepath)
-                    except Exception as e:
-                        print(f"Failed to download {filename}: {e}")
-
-            except httpx.RequestError as e:
-                print(f"Connection error: {e}")
-            except Exception as e:
-                print(f"Error: {e}")
-
-            await asyncio.sleep(POLL_INTERVAL)
+        try:
+            await asyncio.gather(sse_task, poll_task)
+        except asyncio.CancelledError:
+            sse_task.cancel()
+            poll_task.cancel()
 
 
 def main():
