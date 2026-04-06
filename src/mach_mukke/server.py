@@ -1,14 +1,24 @@
 import asyncio
+import hashlib
+import hmac
 import logging
 import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Header
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Header, Response
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-from mach_mukke.config import API_KEY, DOWNLOADS_DIR, TMP_DIR, WISHES_DIR
+from mach_mukke.config import (
+    API_KEY,
+    BIRTHDAY_AGE,
+    BIRTHDAY_NAME,
+    COOKIE_SECRET,
+    DOWNLOADS_DIR,
+    TMP_DIR,
+    WISHES_DIR,
+)
 from mach_mukke.downloader import (
     embed_metadata,
     resolve_final_path,
@@ -42,6 +52,35 @@ def verify_api_key(x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
+def sign_cookie(name: str, age: str) -> str:
+    payload = f"{name}:{age}"
+    sig = hmac.new(COOKIE_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}:{sig}"
+
+
+def verify_cookie(cookie: str | None) -> bool:
+    if not cookie:
+        return False
+    parts = cookie.rsplit(":", 1)
+    if len(parts) != 2:
+        return False
+    payload, sig = parts
+    expected = hmac.new(
+        COOKIE_SECRET.encode(), payload.encode(), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+
+class LoginRequest(BaseModel):
+    name: str
+    age: str
+
+
+def require_auth(mukke_auth: str | None = Cookie(default=None)):
+    if not verify_cookie(mukke_auth):
+        raise HTTPException(status_code=401, detail="Nicht angemeldet")
+
+
 class WishRequest(BaseModel):
     query: str
 
@@ -60,8 +99,31 @@ async def index():
     )
 
 
+@app.get("/api/auth")
+async def check_auth(_=Depends(require_auth)):
+    return {"ok": True}
+
+
+@app.post("/api/login")
+async def login(body: LoginRequest, response: Response):
+    if body.name.strip().lower() != BIRTHDAY_NAME.strip().lower():
+        raise HTTPException(status_code=401, detail="Falsche Antwort!")
+    if body.age.strip() != BIRTHDAY_AGE.strip():
+        raise HTTPException(status_code=401, detail="Falsche Antwort!")
+
+    cookie_value = sign_cookie(body.name, body.age)
+    response.set_cookie(
+        key="mukke_auth",
+        value=cookie_value,
+        httponly=True,
+        samesite="lax",
+        max_age=30 * 24 * 60 * 60,  # 30 days
+    )
+    return {"ok": True}
+
+
 @app.post("/api/wish")
-async def submit_wish(wish: WishRequest):
+async def submit_wish(wish: WishRequest, _=Depends(require_auth)):
     wish_id = secrets.token_hex(8)
     download_tasks[wish_id] = {
         "query": wish.query,

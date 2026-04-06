@@ -15,7 +15,9 @@ RUN pip install --no-cache-dir uv && \
 
 RUN mkdir -p downloads downloads_tmp
 
-ENV MACH_MUKKE_API_KEY="secret"
+ENV MACH_MUKKE_API_KEY=secret
+ENV BIRTHDAY_NAME=Mustermann
+ENV BIRTHDAY_AGE=999
 
 EXPOSE 8000
 

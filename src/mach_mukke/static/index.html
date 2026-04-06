@@ -22,7 +22,7 @@
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
-        .wish-form {
+        .login-form, .wish-form {
             background: rgba(255, 255, 255, 0.05);
             border-radius: 16px;
             padding: 2rem;
@@ -30,6 +30,52 @@
             backdrop-filter: blur(10px);
             border: 1px solid rgba(255, 255, 255, 0.1);
         }
+        .login-form h2 {
+            text-align: center;
+            margin-bottom: 1.5rem;
+            font-size: 1.3rem;
+            color: #ff6b6b;
+        }
+        .login-field {
+            margin-bottom: 1rem;
+        }
+        .login-field label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-size: 0.9rem;
+            color: #aaa;
+        }
+        .login-field input {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            border: none;
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.1);
+            color: #fff;
+            font-size: 1rem;
+            outline: none;
+            transition: box-shadow 0.3s;
+        }
+        .login-field input:focus {
+            box-shadow: 0 0 0 2px #e94560;
+        }
+        .login-field input::placeholder { color: #888; }
+        .login-btn {
+            width: 100%;
+            margin-top: 1rem;
+            padding: 1rem 2rem;
+            border: none;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #e94560, #ff6b6b);
+            color: #fff;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .login-btn:hover { transform: translateY(-2px); box-shadow: 0 4px 15px rgba(233, 69, 96, 0.4); }
+        .login-btn:active { transform: translateY(0); }
+        .login-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
         .input-group { display: flex; gap: 1rem; }
         input[type="text"] {
             flex: 1;
@@ -102,12 +148,25 @@
             z-index: 100;
         }
         .toast.show { transform: translateX(-50%) translateY(0); }
+        .hidden { display: none !important; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Mach Mukke</h1>
-        <div class="wish-form">
+        <div class="login-form" id="loginForm">
+            <h2>Erst ein paar Fragen...</h2>
+            <div class="login-field">
+                <label for="loginName">Wie heißt das Geburtstagskind?</label>
+                <input type="text" id="loginName" placeholder="Name" required autocomplete="off">
+            </div>
+            <div class="login-field">
+                <label for="loginAge">Wie alt wird das Geburtstagskind?</label>
+                <input type="text" id="loginAge" placeholder="Alter" required autocomplete="off">
+            </div>
+            <button type="button" class="login-btn" id="loginBtn">Anmelden</button>
+        </div>
+        <div class="wish-form hidden" id="wishFormContainer">
             <form id="wishForm">
                 <div class="input-group">
                     <input type="text" id="query" placeholder="Song, Künstler" required autocomplete="off">
@@ -115,7 +174,7 @@
                 </div>
             </form>
         </div>
-        <div class="wishes-list">
+        <div class="wishes-list hidden" id="wishesList">
             <h2>Wünsche</h2>
             <div id="wishesContainer">
                 <p class="empty-state">Noch keine Wünsche. Sei der Erste!</p>
@@ -125,15 +184,67 @@
     <div class="toast" id="toast"></div>
 
     <script>
-        const form = document.getElementById('wishForm');
+        const loginForm = document.getElementById('loginForm');
+        const loginName = document.getElementById('loginName');
+        const loginAge = document.getElementById('loginAge');
+        const loginBtn = document.getElementById('loginBtn');
+        const wishFormContainer = document.getElementById('wishFormContainer');
+        const wishForm = document.getElementById('wishForm');
         const queryInput = document.getElementById('query');
         const submitBtn = document.getElementById('submitBtn');
         const wishesContainer = document.getElementById('wishesContainer');
+        const wishesList = document.getElementById('wishesList');
         const toast = document.getElementById('toast');
 
         let wishes = {};
+        let authenticated = false;
 
-        form.addEventListener('submit', async (e) => {
+        loginBtn.addEventListener('click', async () => {
+            const name = loginName.value.trim();
+            const age = loginAge.value.trim();
+            if (!name || !age) return;
+
+            loginBtn.disabled = true;
+            loginBtn.textContent = '...';
+
+            try {
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, age }),
+                });
+                if (!res.ok) {
+                    const data = await res.json();
+                    showToast(data.detail || 'Falsche Antwort!', true);
+                    return;
+                }
+                authenticated = true;
+                loginForm.classList.add('hidden');
+                wishFormContainer.classList.remove('hidden');
+                wishesList.classList.remove('hidden');
+                refreshWishes();
+            } catch (err) {
+                showToast('Fehler beim Anmelden!', true);
+            } finally {
+                loginBtn.disabled = false;
+                loginBtn.textContent = 'Anmelden';
+            }
+        });
+
+        async function checkAuth() {
+            try {
+                const res = await fetch('/api/auth');
+                if (res.ok) {
+                    authenticated = true;
+                    loginForm.classList.add('hidden');
+                    wishFormContainer.classList.remove('hidden');
+                    wishesList.classList.remove('hidden');
+                    refreshWishes();
+                }
+            } catch (err) {}
+        }
+
+        wishForm.addEventListener('submit', async (e) => {
             e.preventDefault();
             const query = queryInput.value.trim();
             if (!query) return;
@@ -147,6 +258,11 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ query }),
                 });
+                if (!res.ok) {
+                    const data = await res.json();
+                    showToast(data.detail || 'Fehler!', true);
+                    return;
+                }
                 const data = await res.json();
                 wishes[data.id] = data;
                 showToast(`"${query}" wurde gewunschen!`);
@@ -211,7 +327,7 @@
         }
 
         setInterval(refreshWishes, 2000);
-        refreshWishes();
+        checkAuth();
     </script>
 </body>
 </html>
