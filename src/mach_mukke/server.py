@@ -98,32 +98,42 @@ async def sse_generator(queue: asyncio.Queue):
         while True:
             event = await queue.get()
             yield f"data: {json.dumps(event)}\n\n"
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, GeneratorExit):
         pass
+    finally:
+        if queue in sse_subscribers:
+            sse_subscribers.remove(queue)
 
 
 @app.get("/api/sse")
 async def sse_endpoint(_=Depends(verify_api_key)):
     queue: asyncio.Queue = asyncio.Queue()
     sse_subscribers.append(queue)
-    try:
-        return StreamingResponse(
-            sse_generator(queue),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-    except GeneratorExit:
-        if queue in sse_subscribers:
-            sse_subscribers.remove(queue)
+    return StreamingResponse(
+        sse_generator(queue),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def notify_sse(event: dict):
+    dead_queues = []
     for queue in list(sse_subscribers):
-        queue.put_nowait(event)
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:
+            logger.warning(f"SSE queue full for subscriber, removing")
+            dead_queues.append(queue)
+        except Exception as e:
+            logger.warning(f"Error sending SSE event: {e}")
+            dead_queues.append(queue)
+    for queue in dead_queues:
+        if queue in sse_subscribers:
+            sse_subscribers.remove(queue)
 
 
 async def run_yt_dlp(query: str, output_template: str) -> tuple[dict | None, str, str]:

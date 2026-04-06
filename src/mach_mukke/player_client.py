@@ -77,6 +77,7 @@ async def add_to_rmpc(filepath: Path) -> None:
 
 
 async def sse_listener(client: httpx.AsyncClient, known_files: set[str]):
+    delay = 1
     while True:
         try:
             async with client.stream(
@@ -86,6 +87,9 @@ async def sse_listener(client: httpx.AsyncClient, known_files: set[str]):
                 timeout=None,
             ) as resp:
                 resp.raise_for_status()
+                if delay > 1:
+                    print(f"SSE reconnected successfully")
+                delay = 1
                 async for line in resp.aiter_lines():
                     if line.startswith("data: "):
                         data = json.loads(line[6:])
@@ -99,9 +103,15 @@ async def sse_listener(client: httpx.AsyncClient, known_files: set[str]):
                                     await add_to_rmpc(filepath)
                                 except Exception as e:
                                     print(f"Failed to download {filename}: {e}")
-        except (httpx.RequestError, asyncio.CancelledError):
-            print("SSE connection lost, will retry...")
-            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            raise
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            msg = f"SSE connection lost ({e}), retrying in {delay}s..."
+            print(msg)
+        except Exception as e:
+            print(f"SSE error ({e}), retrying in {delay}s...")
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 60)
 
 
 async def poll_fallback(client: httpx.AsyncClient, known_files: set[str]):
