@@ -160,6 +160,12 @@ class SimilarResponse(BaseModel):
     tracks: list[Track]
 
 
+class TagQueueResponse(BaseModel):
+    queued: int
+    skipped: int
+    tracks: list[Track]
+
+
 def clean_track_for_lookup(artist: str, title: str) -> Track:
     cleaned_artist = artist.strip()
     cleaned_title = title.strip()
@@ -186,6 +192,22 @@ def fetch_similar_tracks_sync(artist: str, title: str, limit: int = 3) -> list[T
     for item in similar_items:
         similar = item.item
         results.append(Track(artist=similar.artist.name, title=similar.title))
+    return results
+
+
+def fetch_tag_top_tracks_sync(tag: str, limit: int = 10) -> list[Track]:
+    network = pylast.LastFMNetwork(
+        api_key=LASTFM_API_KEY, api_secret=LASTFM_API_SECRET
+    )
+    tag_obj = network.get_tag(tag)
+    results: list[Track] = []
+    try:
+        top_items = tag_obj.get_top_tracks(limit=limit)
+    except TypeError:
+        top_items = tag_obj.get_top_tracks(limit=limit)
+    for item in top_items:
+        track = item.item
+        results.append(Track(artist=track.artist.name, title=track.title))
     return results
 
 
@@ -297,6 +319,50 @@ async def find_similar_tracks(body: SimilarRequest, _=Depends(verify_api_key)):
         queued += 1
 
     return SimilarResponse(queued=queued, skipped=skipped, tracks=unique)
+
+
+@app.post("/api/tag/queue", response_model=TagQueueResponse)
+async def queue_tag_top_tracks(tag: str, limit: int = 15, _=Depends(verify_api_key)):
+    if not LASTFM_API_KEY or not LASTFM_API_SECRET:
+        raise HTTPException(
+            status_code=500, detail="Last.fm API key/secret not configured on server"
+        )
+    safe_limit = max(1, min(limit, 50))
+    try:
+        tracks = await asyncio.to_thread(fetch_tag_top_tracks_sync, tag, safe_limit)
+    except Exception as e:
+        logger.warning("Tag lookup failed: %s", e)
+        raise HTTPException(status_code=502, detail="Tag lookup failed") from e
+
+    if not tracks:
+        return TagQueueResponse(queued=0, skipped=0, tracks=[])
+
+    existing_queries: set[str] = set()
+    for task in download_tasks.values():
+        query = task["query"]
+        if " - " in query:
+            artist, title = query.split(" - ", 1)
+            existing_queries.add(normalize_track_key(artist, title))
+
+    queued = 0
+    skipped = 0
+    unique: list[Track] = []
+    seen: set[str] = set()
+    for track in tracks:
+        key = normalize_track_key(track.artist, track.title)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(track)
+
+    for track in unique:
+        if normalize_track_key(track.artist, track.title) in existing_queries:
+            skipped += 1
+            continue
+        await enqueue_download(f"{track.artist} - {track.title}")
+        queued += 1
+
+    return TagQueueResponse(queued=queued, skipped=skipped, tracks=unique)
 
 
 @app.get("/api/downloads")

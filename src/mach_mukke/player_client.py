@@ -119,11 +119,17 @@ class PlayerClientApp(App):
         self.query_one(RichLog).clear()
 
     def action_help(self) -> None:
-        self.log_line("Commands: wish <query> | similar | reconnect | help | quit", "cyan")
+        self.log_line(
+            "Commands: wish <query> | similar | tag <tag> [limit] | reconnect | help | quit",
+            "cyan",
+        )
         self.log_line(
             "similar -> fetch similar tracks for the current rmpc queue", "cyan"
         )
         self.log_line("wish <query> -> submit a download wish", "cyan")
+        self.log_line(
+            "tag <tag> [limit] -> queue top tracks for a Last.fm tag", "cyan"
+        )
         self.log_line("reconnect -> restart server connection tasks", "cyan")
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -153,6 +159,20 @@ class PlayerClientApp(App):
                 await self.submit_wish(" ".join(parts[1:]))
         elif cmd in {"similar", "sim"}:
             await self.request_similar_tracks()
+        elif cmd in {"tag", "search"}:
+            if len(parts) < 2:
+                self.log_line("Usage: tag <tag> [limit]", "yellow")
+            else:
+                limit = 10
+                tag_parts = parts[1:]
+                if len(tag_parts) >= 2 and tag_parts[-1].isdigit():
+                    limit = int(tag_parts[-1])
+                    tag_parts = tag_parts[:-1]
+                tag = " ".join(tag_parts).strip()
+                if not tag:
+                    self.log_line("Usage: tag <tag> [limit]", "yellow")
+                else:
+                    await self.request_tag_top_tracks(tag, limit)
         elif cmd in {"reconnect", "reconn"}:
             await self.reconnect()
         else:
@@ -397,6 +417,35 @@ class PlayerClientApp(App):
             self.log_line(f"Similar request failed: {detail}", "red")
         except Exception as e:
             self.log_line(f"Similar request error: {e}", "red")
+
+    async def request_tag_top_tracks(self, tag: str, limit: int = 10) -> None:
+        if not self.client:
+            return
+        safe_limit = max(1, min(limit, 50))
+        self.log_line(f"Queueing top tracks for tag: {tag} (limit {safe_limit})")
+        try:
+            resp = await self.client.post(
+                "/api/tag/queue",
+                headers={"X-API-Key": API_KEY},
+                params={"tag": tag, "limit": safe_limit},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            queued = payload.get("queued", 0)
+            skipped = payload.get("skipped", 0)
+            returned = payload.get("tracks", [])
+            if not returned:
+                self.log_line(f"No tracks found for tag: {tag}", "yellow")
+                return
+            self.log_line(
+                f"Tag tracks queued: {queued} (skipped: {skipped}, found: {len(returned)})",
+                "green",
+            )
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text if e.response else str(e)
+            self.log_line(f"Tag lookup failed: {detail}", "red")
+        except Exception as e:
+            self.log_line(f"Tag lookup error: {e}", "red")
 
 
 def main() -> None:
