@@ -3,9 +3,11 @@ import hashlib
 import hmac
 import logging
 import secrets
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import pylast
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Header, Response
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
@@ -16,6 +18,8 @@ from mach_mukke.config import (
     BIRTHDAY_NAME,
     COOKIE_SECRET,
     DOWNLOADS_DIR,
+    LASTFM_API_KEY,
+    LASTFM_API_SECRET,
     TMP_DIR,
     WISHES_DIR,
 )
@@ -71,6 +75,32 @@ def verify_cookie(cookie: str | None) -> bool:
     return hmac.compare_digest(sig, expected)
 
 
+def normalize_track_key(artist: str, title: str) -> str:
+    return f"{normalize_artist(artist)} - {normalize_title(title)}"
+
+
+def normalize_artist(artist: str) -> str:
+    return artist.strip().lower()
+
+
+def normalize_title(title: str) -> str:
+    base = title.strip().lower()
+    base = base.replace("&", "and")
+    base = base.replace("/", " ")
+    base = base.replace("_", " ")
+    base = re.sub(r"\s+", " ", base)
+    base = re.sub(r"\s*\([^)]*\)", "", base)
+    base = re.sub(r"\s*\[[^]]*\]", "", base)
+    base = re.sub(r"\s*\{[^}]*\}", "", base)
+    base = re.sub(
+        r"\b(live|remaster(ed)?|remix|version|edit|mix|acoustic|mono|stereo|radio|demo|deluxe|explicit|clean)\b",
+        "",
+        base,
+    )
+    base = re.sub(r"\s+", " ", base)
+    return base.strip()
+
+
 class LoginRequest(BaseModel):
     name: str
     age: str
@@ -79,6 +109,28 @@ class LoginRequest(BaseModel):
 def require_auth(mukke_auth: str | None = Cookie(default=None)):
     if not verify_cookie(mukke_auth):
         raise HTTPException(status_code=401, detail="Nicht angemeldet")
+
+
+def require_auth_or_api_key(
+    mukke_auth: str | None = Cookie(default=None),
+    x_api_key: str | None = Header(default=None),
+):
+    if x_api_key == API_KEY:
+        return
+    if not verify_cookie(mukke_auth):
+        raise HTTPException(status_code=401, detail="Nicht angemeldet")
+
+
+async def enqueue_download(query: str) -> str:
+    wish_id = secrets.token_hex(8)
+    download_tasks[wish_id] = {
+        "query": query,
+        "status": "queued",
+        "filename": None,
+        "error": None,
+    }
+    await download_queue.put(wish_id)
+    return wish_id
 
 
 class WishRequest(BaseModel):
@@ -90,6 +142,51 @@ class WishStatus(BaseModel):
     query: str
     status: str
     filename: str | None = None
+    error: str | None = None
+
+
+class Track(BaseModel):
+    artist: str
+    title: str
+
+
+class SimilarRequest(BaseModel):
+    tracks: list[Track]
+
+
+class SimilarResponse(BaseModel):
+    queued: int
+    skipped: int
+    tracks: list[Track]
+
+
+def clean_track_for_lookup(artist: str, title: str) -> Track:
+    cleaned_artist = artist.strip()
+    cleaned_title = title.strip()
+    if cleaned_artist:
+        prefix = f"{cleaned_artist} - "
+        if cleaned_title.lower().startswith(prefix.lower()):
+            cleaned_title = cleaned_title[len(prefix) :].strip()
+    cleaned_title = re.sub(r"\s*[\(\[].*?[\)\]]\s*", " ", cleaned_title)
+    cleaned_title = re.sub(r"\s+", " ", cleaned_title).strip()
+    return Track(artist=cleaned_artist, title=cleaned_title)
+
+
+def fetch_similar_tracks_sync(artist: str, title: str, limit: int = 3) -> list[Track]:
+    network = pylast.LastFMNetwork(
+        api_key=LASTFM_API_KEY, api_secret=LASTFM_API_SECRET
+    )
+    cleaned = clean_track_for_lookup(artist, title)
+    track = network.get_track(cleaned.artist, cleaned.title)
+    results: list[Track] = []
+    try:
+        similar_items = track.get_similar(limit=limit, autocorrect=True)
+    except TypeError:
+        similar_items = track.get_similar(limit=limit)
+    for item in similar_items:
+        similar = item.item
+        results.append(Track(artist=similar.artist.name, title=similar.title))
+    return results
 
 
 @app.get("/")
@@ -123,14 +220,8 @@ async def login(body: LoginRequest, response: Response):
 
 
 @app.post("/api/wish")
-async def submit_wish(wish: WishRequest, _=Depends(require_auth)):
-    wish_id = secrets.token_hex(8)
-    download_tasks[wish_id] = {
-        "query": wish.query,
-        "status": "queued",
-        "filename": None,
-    }
-    await download_queue.put(wish_id)
+async def submit_wish(wish: WishRequest, _=Depends(require_auth_or_api_key)):
+    wish_id = await enqueue_download(wish.query)
     return {"id": wish_id, "status": "queued"}
 
 
@@ -145,6 +236,67 @@ async def get_wish_status(wish_id: str):
 @app.get("/api/wishes")
 async def list_wishes():
     return [WishStatus(id=wish_id, **task) for wish_id, task in download_tasks.items()]
+
+
+@app.post("/api/similar", response_model=SimilarResponse)
+async def find_similar_tracks(body: SimilarRequest, _=Depends(verify_api_key)):
+    if not LASTFM_API_KEY or not LASTFM_API_SECRET:
+        raise HTTPException(
+            status_code=500, detail="Last.fm API key/secret not configured on server"
+        )
+
+    source_tracks = [
+        clean_track_for_lookup(t.artist, t.title)
+        for t in body.tracks
+        if t.artist.strip() and t.title.strip()
+    ]
+    if not source_tracks:
+        raise HTTPException(status_code=400, detail="No valid tracks provided")
+
+    results = await asyncio.gather(
+        *[
+            asyncio.to_thread(
+                fetch_similar_tracks_sync, track.artist, track.title, 3
+            )
+            for track in source_tracks
+        ],
+        return_exceptions=True,
+    )
+
+    similar: list[Track] = []
+    for result in results:
+        if isinstance(result, Exception):
+            logger.warning("Similar track lookup failed: %s", result)
+            continue
+        similar.extend(result)
+
+    source_keys = {normalize_track_key(t.artist, t.title) for t in source_tracks}
+    seen: set[str] = set()
+    unique: list[Track] = []
+    for track in similar:
+        key = normalize_track_key(track.artist, track.title)
+        if key in seen or key in source_keys:
+            continue
+        seen.add(key)
+        unique.append(track)
+
+    existing_queries: set[str] = set()
+    for task in download_tasks.values():
+        query = task["query"]
+        if " - " in query:
+            artist, title = query.split(" - ", 1)
+            existing_queries.add(normalize_track_key(artist, title))
+    queued = 0
+    skipped = 0
+    for track in unique:
+        query = f"{track.artist} - {track.title}"
+        if normalize_track_key(track.artist, track.title) in existing_queries:
+            skipped += 1
+            continue
+        await enqueue_download(query)
+        queued += 1
+
+    return SimilarResponse(queued=queued, skipped=skipped, tracks=unique)
 
 
 @app.get("/api/downloads")

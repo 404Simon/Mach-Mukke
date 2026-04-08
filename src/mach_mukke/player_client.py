@@ -1,9 +1,17 @@
 import asyncio
 import json
 import os
+import re
+import shlex
+from datetime import datetime
 from pathlib import Path
 
 import httpx
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Vertical
+from textual.widgets import Footer, Header, Input, RichLog
+from rich.text import Text
 
 SERVER_URL = os.environ.get("MACH_MUKKE_SERVER_URL", "http://localhost:8000")
 API_KEY = os.environ.get("MACH_MUKKE_API_KEY", "")
@@ -18,147 +26,381 @@ def load_known_files() -> set[str]:
     return {f.name for f in MUSIC_DIR.iterdir() if f.is_file()}
 
 
-async def poll_new_downloads(
-    client: httpx.AsyncClient, known_files: set[str]
-) -> list[str]:
-    resp = await client.get("/api/downloads", headers={"X-API-Key": API_KEY})
-    resp.raise_for_status()
-    downloads = resp.json()
-
-    new_files = []
-    for d in downloads:
-        filename = d["filename"]
-        if filename not in known_files:
-            new_files.append(filename)
-
-    return new_files
-
-
-async def download_file(client: httpx.AsyncClient, filename: str) -> Path:
-    MUSIC_DIR.mkdir(parents=True, exist_ok=True)
-    dest = MUSIC_DIR / filename
-
-    async with client.stream(
-        "GET", f"/api/downloads/{filename}", headers={"X-API-Key": API_KEY}
-    ) as resp:
-        resp.raise_for_status()
-        with open(dest, "wb") as f:
-            async for chunk in resp.aiter_bytes():
-                f.write(chunk)
-
-    return dest
+def parse_rmpc_queue(output: str) -> list[dict[str, str]]:
+    tracks: list[dict[str, str]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^\s*\d+\.\s*", "", line)
+        line = re.sub(r"\s*[•·]\s*\d{1,2}:\d{2}\s*$", "", line)
+        line = re.sub(r"\s*\(\d{1,2}:\d{2}\)\s*$", "", line)
+        line = re.sub(r"\s*\[\d{1,2}:\d{2}\]\s*$", "", line)
+        parts = re.split(r"\s[-–—]\s", line, maxsplit=1)
+        if len(parts) != 2:
+            continue
+        artist, title = (p.strip() for p in parts)
+        if not artist or not title:
+            continue
+        tracks.append({"artist": artist, "title": title})
+    return tracks
 
 
-async def add_to_rmpc(filepath: Path) -> None:
-    relative_path = filepath.relative_to(MPD_MUSIC_DIR)
+class PlayerClientApp(App):
+    TITLE = "Mach Mukke!"
+    CSS = """
+    Screen {
+        layout: vertical;
+        background: #101416;
+    }
 
-    update_proc = await asyncio.create_subprocess_exec(
-        "rmpc",
-        "update",
-        str(relative_path.parent),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    await update_proc.communicate()
+    #log {
+        height: 1fr;
+        border: round #4da3ff;
+        padding: 1 2;
+        background: #0c0f12;
+    }
 
-    proc = await asyncio.create_subprocess_exec(
-        "rmpc",
-        "add",
-        str(relative_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
+    #input {
+        height: 3;
+        border: round #f4b860;
+        padding: 0 1;
+        background: #12171a;
+    }
+    """
 
-    if proc.returncode != 0:
-        print(f"Failed to add {relative_path} to rmpc: {stderr.decode()}")
-    else:
-        print(f"Added to rmpc queue: {relative_path}")
+    BINDINGS = [
+        Binding("ctrl+c", "quit", "Quit"),
+        Binding("ctrl+l", "clear_log", "Clear Log", priority=True),
+        Binding("f1", "help", "Help"),
+    ]
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.client: httpx.AsyncClient | None = None
+        self.known_files: set[str] = load_known_files()
+        self.tasks: list[asyncio.Task] = []
 
-async def sse_listener(client: httpx.AsyncClient, known_files: set[str]):
-    delay = 1
-    while True:
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Vertical(RichLog(id="log", wrap=True))
+        yield Input(placeholder="Type a command (F1 for help)", id="input")
+        yield Footer()
+
+    async def on_mount(self) -> None:
+        if not API_KEY:
+            self.log_line("MACH_MUKKE_API_KEY is required.", "red")
+            return
+        self.client = httpx.AsyncClient(base_url=SERVER_URL, timeout=60.0)
+        self.log_line(f"Known files: {len(self.known_files)} in {MUSIC_DIR}")
+        self.log_line(f"Connecting to {SERVER_URL}")
+        self.action_help()
+        self.tasks = [
+            asyncio.create_task(self.sse_listener()),
+            asyncio.create_task(self.poll_fallback()),
+        ]
+
+    async def on_unmount(self) -> None:
+        for task in self.tasks:
+            task.cancel()
+        if self.client:
+            await self.client.aclose()
+
+    def log_line(self, message: str, style: str | None = None) -> None:
+        log = self.query_one(RichLog)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        prefix = f"[{timestamp}] "
+        if style:
+            log.write(Text(prefix + message, style=style))
+        else:
+            log.write(prefix + message)
+
+    def action_clear_log(self) -> None:
+        self.query_one(RichLog).clear()
+
+    def action_help(self) -> None:
+        self.log_line("Commands: wish <query> | similar | reconnect | help | quit", "cyan")
+        self.log_line(
+            "similar -> fetch similar tracks for the current rmpc queue", "cyan"
+        )
+        self.log_line("wish <query> -> submit a download wish", "cyan")
+        self.log_line("reconnect -> restart server connection tasks", "cyan")
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        event.input.value = ""
+        if not text:
+            return
+        await self.handle_command(text)
+
+    async def handle_command(self, text: str) -> None:
         try:
-            async with client.stream(
-                "GET",
-                "/api/sse",
+            parts = shlex.split(text)
+        except ValueError as e:
+            self.log_line(f"Command parse error: {e}", "red")
+            return
+        if not parts:
+            return
+        cmd = parts[0].lower()
+        if cmd in {"quit", "exit"}:
+            self.exit()
+        elif cmd in {"help", "?"}:
+            self.action_help()
+        elif cmd in {"wish"}:
+            if len(parts) < 2:
+                self.log_line("Usage: wish <query>", "yellow")
+            else:
+                await self.submit_wish(" ".join(parts[1:]))
+        elif cmd in {"similar", "sim"}:
+            await self.request_similar_tracks()
+        elif cmd in {"reconnect", "reconn"}:
+            await self.reconnect()
+        else:
+            self.log_line(f"Unknown command: {cmd}", "yellow")
+
+    async def submit_wish(self, query: str) -> None:
+        if not self.client:
+            return
+        self.log_line(f"Submitting wish: {query}")
+        try:
+            resp = await self.client.post(
+                "/api/wish",
                 headers={"X-API-Key": API_KEY},
-                timeout=None,
-            ) as resp:
-                resp.raise_for_status()
-                if delay > 1:
-                    print(f"SSE reconnected successfully")
-                delay = 1
-                async for line in resp.aiter_lines():
-                    if line.startswith("data: "):
-                        data = json.loads(line[6:])
-                        if data.get("event") == "download_complete":
-                            filename = data.get("filename")
-                            if filename and filename not in known_files:
-                                print(f"Downloading (SSE): {filename}")
-                                try:
-                                    filepath = await download_file(client, filename)
-                                    known_files.add(filename)
-                                    await add_to_rmpc(filepath)
-                                except Exception as e:
-                                    print(f"Failed to download {filename}: {e}")
-        except asyncio.CancelledError:
-            raise
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            msg = f"SSE connection lost ({e}), retrying in {delay}s..."
-            print(msg)
+                json={"query": query},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            wish_id = data.get("id", "unknown")
+            self.log_line(f"Wish queued: {wish_id}", "green")
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text if e.response else str(e)
+            self.log_line(f"Wish failed: {detail}", "red")
         except Exception as e:
-            print(f"SSE error ({e}), retrying in {delay}s...")
-        await asyncio.sleep(delay)
-        delay = min(delay * 2, 60)
+            self.log_line(f"Wish error: {e}", "red")
 
-
-async def poll_fallback(client: httpx.AsyncClient, known_files: set[str]):
-    while True:
+    async def reconnect(self) -> None:
+        for task in self.tasks:
+            task.cancel()
+        self.tasks = []
+        if self.client:
+            await self.client.aclose()
+            self.client = None
+        self.log_line("Reconnecting...", "yellow")
         try:
-            new_files = await poll_new_downloads(client, known_files)
-            for filename in new_files:
-                print(f"Downloading (poll): {filename}")
-                try:
-                    filepath = await download_file(client, filename)
-                    known_files.add(filename)
-                    await add_to_rmpc(filepath)
-                except Exception as e:
-                    print(f"Failed to download {filename}: {e}")
-        except httpx.RequestError as e:
-            print(f"Connection error: {e}")
+            self.client = httpx.AsyncClient(base_url=SERVER_URL, timeout=60.0)
+            self.tasks = [
+                asyncio.create_task(self.sse_listener()),
+                asyncio.create_task(self.poll_fallback()),
+            ]
+            self.log_line("Reconnect tasks started.", "green")
         except Exception as e:
-            print(f"Error: {e}")
+            self.log_line(f"Reconnect failed: {e}", "red")
 
-        await asyncio.sleep(POLL_INTERVAL)
+    async def poll_new_downloads(self) -> list[str]:
+        assert self.client is not None
+        resp = await self.client.get("/api/downloads", headers={"X-API-Key": API_KEY})
+        resp.raise_for_status()
+        downloads = resp.json()
 
+        new_files = []
+        for d in downloads:
+            filename = d["filename"]
+            if filename not in self.known_files:
+                new_files.append(filename)
 
-async def main_loop():
-    if not API_KEY:
-        print("Error: MACH_MUKKE_API_KEY environment variable is required")
-        return
+        return new_files
 
-    headers = {"X-API-Key": API_KEY}
-    known_files: set[str] = load_known_files()
-    print(f"Already known {len(known_files)} files from {MUSIC_DIR}")
+    async def download_file(self, filename: str) -> Path:
+        assert self.client is not None
+        MUSIC_DIR.mkdir(parents=True, exist_ok=True)
+        dest = MUSIC_DIR / filename
 
-    async with httpx.AsyncClient(base_url=SERVER_URL, timeout=60.0) as client:
-        print(f"Connecting to {SERVER_URL} for new music...")
-        print(f"Music directory: {MUSIC_DIR}")
+        async with self.client.stream(
+            "GET", f"/api/downloads/{filename}", headers={"X-API-Key": API_KEY}
+        ) as resp:
+            resp.raise_for_status()
+            with open(dest, "wb") as f:
+                async for chunk in resp.aiter_bytes():
+                    f.write(chunk)
 
-        sse_task = asyncio.create_task(sse_listener(client, known_files))
-        poll_task = asyncio.create_task(poll_fallback(client, known_files))
+        return dest
 
+    async def add_to_rmpc(self, filepath: Path) -> None:
+        relative_path = filepath.relative_to(MPD_MUSIC_DIR)
+
+        update_proc = await asyncio.create_subprocess_exec(
+            "rmpc",
+            "update",
+            str(relative_path.parent),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await update_proc.communicate()
+
+        proc = await asyncio.create_subprocess_exec(
+            "rmpc",
+            "add",
+            str(relative_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            self.log_line(
+                f"Failed to add {relative_path} to rmpc: {stderr.decode().strip()}",
+                "red",
+            )
+        else:
+            self.log_line(f"Added to rmpc queue: {relative_path}", "green")
+
+    async def sse_listener(self) -> None:
+        assert self.client is not None
+        delay = 1
+        while True:
+            try:
+                async with self.client.stream(
+                    "GET",
+                    "/api/sse",
+                    headers={"X-API-Key": API_KEY},
+                    timeout=None,
+                ) as resp:
+                    resp.raise_for_status()
+                    if delay > 1:
+                        self.log_line("SSE reconnected successfully", "green")
+                    delay = 1
+                    async for line in resp.aiter_lines():
+                        if line.startswith("data: "):
+                            data = json.loads(line[6:])
+                            if data.get("event") == "download_complete":
+                                filename = data.get("filename")
+                                if filename and filename not in self.known_files:
+                                    self.log_line(f"Downloading (SSE): {filename}")
+                                    try:
+                                        filepath = await self.download_file(filename)
+                                        self.known_files.add(filename)
+                                        await self.add_to_rmpc(filepath)
+                                    except Exception as e:
+                                        self.log_line(
+                                            f"Failed to download {filename}: {e}",
+                                            "red",
+                                        )
+            except asyncio.CancelledError:
+                raise
+            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+                self.log_line(
+                    f"SSE connection lost ({e}), retrying in {delay}s...", "yellow"
+                )
+            except Exception as e:
+                self.log_line(f"SSE error ({e}), retrying in {delay}s...", "yellow")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+
+    async def poll_fallback(self) -> None:
+        while True:
+            try:
+                new_files = await self.poll_new_downloads()
+                for filename in new_files:
+                    self.log_line(f"Downloading (poll): {filename}")
+                    try:
+                        filepath = await self.download_file(filename)
+                        self.known_files.add(filename)
+                        await self.add_to_rmpc(filepath)
+                    except Exception as e:
+                        self.log_line(f"Failed to download {filename}: {e}", "red")
+            except httpx.RequestError as e:
+                self.log_line(f"Connection error: {e}", "yellow")
+            except Exception as e:
+                self.log_line(f"Error: {e}", "yellow")
+
+            await asyncio.sleep(POLL_INTERVAL)
+
+    async def read_rmpc_queue(self) -> list[dict[str, str]]:
         try:
-            await asyncio.gather(sse_task, poll_task)
-        except asyncio.CancelledError:
-            sse_task.cancel()
-            poll_task.cancel()
+            proc = await asyncio.create_subprocess_exec(
+                "rmpc",
+                "queue",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                self.log_line(
+                    f"rmpc queue failed: {stderr.decode().strip()}", "red"
+                )
+                return []
+            output = stdout.decode()
+            payload = None
+            try:
+                payload = json.loads(output)
+            except json.JSONDecodeError:
+                start = output.find("[")
+                end = output.rfind("]")
+                if start != -1 and end != -1 and end > start:
+                    try:
+                        payload = json.loads(output[start : end + 1])
+                    except json.JSONDecodeError:
+                        payload = None
+
+            if isinstance(payload, list):
+                tracks: list[dict[str, str]] = []
+                for item in payload:
+                    if not isinstance(item, dict):
+                        continue
+                    meta = item.get("metadata") or {}
+                    artist = (meta.get("artist") or "").strip()
+                    title = (meta.get("title") or "").strip()
+                    if artist and title and title.lower().startswith(artist.lower() + " - "):
+                        title = title[len(artist) + 3 :].strip()
+                    if artist and title:
+                        tracks.append({"artist": artist, "title": title})
+                if tracks:
+                    return tracks
+
+            return parse_rmpc_queue(output)
+        except FileNotFoundError:
+            self.log_line("rmpc not found in PATH", "red")
+            return []
+
+    async def request_similar_tracks(self) -> None:
+        if not self.client:
+            return
+        tracks = await self.read_rmpc_queue()
+        if not tracks:
+            self.log_line("No tracks found in rmpc queue.", "yellow")
+            return
+        self.log_line(f"Requesting similar tracks for {len(tracks)} queue entries...")
+        try:
+            resp = await self.client.post(
+                "/api/similar",
+                headers={"X-API-Key": API_KEY},
+                json={"tracks": tracks},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            queued = payload.get("queued", 0)
+            skipped = payload.get("skipped", 0)
+            returned = payload.get("tracks", [])
+            self.log_line(
+                f"Similar tracks queued: {queued} (skipped: {skipped}, found: {len(returned)})",
+                "green",
+            )
+            if not returned:
+                self.log_line("No similar tracks found for the current queue.", "yellow")
+            else:
+                preview = ", ".join(
+                    f"{t.get('artist')} - {t.get('title')}" for t in returned[:5]
+                )
+                self.log_line(f"Similar preview: {preview}", "cyan")
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text if e.response else str(e)
+            self.log_line(f"Similar request failed: {detail}", "red")
+        except Exception as e:
+            self.log_line(f"Similar request error: {e}", "red")
 
 
-def main():
-    asyncio.run(main_loop())
+def main() -> None:
+    PlayerClientApp().run()
 
 
 if __name__ == "__main__":
