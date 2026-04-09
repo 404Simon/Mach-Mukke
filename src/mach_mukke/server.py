@@ -21,7 +21,6 @@ from mach_mukke.config import (
     LASTFM_API_KEY,
     LASTFM_API_SECRET,
     TMP_DIR,
-    WISHES_DIR,
 )
 from mach_mukke.downloader import (
     apply_r128_track_gain,
@@ -43,7 +42,6 @@ download_tasks: dict[str, dict] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    WISHES_DIR.mkdir(exist_ok=True)
     DOWNLOADS_DIR.mkdir(exist_ok=True)
     TMP_DIR.mkdir(exist_ok=True)
     asyncio.create_task(process_downloads())

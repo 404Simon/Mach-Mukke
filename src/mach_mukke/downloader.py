@@ -1,12 +1,11 @@
 import asyncio
 import json
 import logging
-import re
 from pathlib import Path
 
 from mutagen.oggopus import OggOpus
 
-from mach_mukke.config import MAX_DURATION_SECONDS, TMP_DIR
+from mach_mukke.config import MAX_DURATION_SECONDS
 
 logger = logging.getLogger("mach_mukke.downloader")
 

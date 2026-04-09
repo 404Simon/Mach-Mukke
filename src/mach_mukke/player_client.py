@@ -88,6 +88,7 @@ class PlayerClientApp(App):
         yield Footer()
 
     async def on_mount(self) -> None:
+        self.query_one(Input).focus()
         if not API_KEY:
             self.log_line("MACH_MUKKE_API_KEY is required.", "red")
             return
