@@ -24,7 +24,9 @@ from mach_mukke.config import (
     WISHES_DIR,
 )
 from mach_mukke.downloader import (
+    apply_r128_track_gain,
     embed_metadata,
+    get_r128_track_gain,
     resolve_final_path,
     run_yt_dlp,
     sanitize_filename,
@@ -374,6 +376,7 @@ async def list_downloads(_=Depends(verify_api_key)):
         for f in sorted(
             DOWNLOADS_DIR.glob("*.opus"), key=lambda f: f.stat().st_mtime, reverse=True
         )
+        if get_r128_track_gain(f) is not None
     ]
 
 
@@ -382,6 +385,8 @@ async def get_download(filename: str, _=Depends(verify_api_key)):
     file_path = DOWNLOADS_DIR / filename
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
+    if get_r128_track_gain(file_path) is None:
+        raise HTTPException(status_code=409, detail="File not tagged yet")
     return FileResponse(str(file_path))
 
 
@@ -438,6 +443,14 @@ async def process_wish(wish_id: str):
 
     if metadata:
         embed_metadata(opus_path, metadata)
+
+    tagged, tag_msg = await apply_r128_track_gain(opus_path)
+    if not tagged:
+        task["status"] = "failed"
+        task["error"] = tag_msg
+        logger.error(f"Tagging failed for {opus_path}: {tag_msg}")
+        opus_path.unlink(missing_ok=True)
+        return
 
     base_name = (
         f"{sanitize_filename(metadata.get('title', 'unknown'))}.opus"
