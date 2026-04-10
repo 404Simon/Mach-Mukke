@@ -136,6 +136,7 @@ class Track(BaseModel):
 
 class SimilarRequest(BaseModel):
     tracks: list[Track]
+    limit: int = 3
 
 
 class SimilarResponse(BaseModel):
@@ -238,6 +239,8 @@ async def find_similar_tracks(body: SimilarRequest, _=Depends(verify_api_key)):
     if not source_tracks:
         raise HTTPException(status_code=400, detail="No valid tracks provided")
 
+    safe_limit = max(1, min(body.limit, 50))
+
     results = await asyncio.gather(
         *[
             asyncio.to_thread(
@@ -246,7 +249,7 @@ async def find_similar_tracks(body: SimilarRequest, _=Depends(verify_api_key)):
                 track.title,
                 LASTFM_API_KEY,
                 LASTFM_API_SECRET,
-                3,
+                safe_limit,
             )
             for track in source_tracks
         ],

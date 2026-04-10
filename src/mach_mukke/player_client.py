@@ -119,11 +119,12 @@ class PlayerClientApp(App):
 
     def action_help(self) -> None:
         self.log_line(
-            "Commands: wish <query> | similar | tag <tag> [limit] | wishing | togglewishing | reconnect | help | quit",
+            "Commands: wish <query> | similar [limit] | tag <tag> [limit] | wishing | togglewishing | reconnect | help | quit",
             "cyan",
         )
         self.log_line(
-            "similar -> fetch similar tracks for the current rmpc queue", "cyan"
+            "similar [limit] -> fetch similar tracks for the current rmpc queue",
+            "cyan",
         )
         self.log_line("wish <query> -> submit a download wish", "cyan")
         self.log_line("tag <tag> [limit] -> queue top tracks for a Last.fm tag", "cyan")
@@ -157,7 +158,14 @@ class PlayerClientApp(App):
             else:
                 await self.submit_wish(" ".join(parts[1:]))
         elif cmd in {"similar", "sim"}:
-            await self.request_similar_tracks()
+            limit = 3
+            if len(parts) >= 2:
+                if parts[1].isdigit():
+                    limit = int(parts[1])
+                else:
+                    self.log_line("Usage: similar [limit]", "yellow")
+                    return
+            await self.request_similar_tracks(limit)
         elif cmd in {"tag", "search"}:
             if len(parts) < 2:
                 self.log_line("Usage: tag <tag> [limit]", "yellow")
@@ -402,19 +410,22 @@ class PlayerClientApp(App):
             self.log_line("rmpc not found in PATH", "red")
             return []
 
-    async def request_similar_tracks(self) -> None:
+    async def request_similar_tracks(self, limit: int = 3) -> None:
         if not self.client:
             return
+        safe_limit = max(1, min(limit, 50))
         tracks = await self.read_rmpc_queue()
         if not tracks:
             self.log_line("No tracks found in rmpc queue.", "yellow")
             return
-        self.log_line(f"Requesting similar tracks for {len(tracks)} queue entries...")
+        self.log_line(
+            f"Requesting {safe_limit} similar tracks for {len(tracks)} queue entries..."
+        )
         try:
             resp = await self.client.post(
                 "/api/similar",
                 headers={"X-API-Key": API_KEY},
-                json={"tracks": tracks},
+                json={"tracks": tracks, "limit": safe_limit},
             )
             resp.raise_for_status()
             payload = resp.json()
