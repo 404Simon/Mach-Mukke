@@ -10,6 +10,7 @@ from pathlib import Path
 import pylast
 import uvicorn
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Response
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -54,6 +55,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Mach Mukke Server", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
 def verify_api_key(x_api_key: str | None = Header(default=None)):
@@ -393,7 +395,7 @@ async def list_downloads(_=Depends(verify_api_key)):
     if not DOWNLOADS_DIR.exists():
         return []
     return [
-        {"filename": f.name, "path": str(f)}
+        {"filename": f.name}
         for f in sorted(
             DOWNLOADS_DIR.glob("*.opus"), key=lambda f: f.stat().st_mtime, reverse=True
         )

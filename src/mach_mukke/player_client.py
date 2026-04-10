@@ -17,7 +17,6 @@ SERVER_URL = os.environ.get("MACH_MUKKE_SERVER_URL", "http://localhost:8000")
 API_KEY = os.environ.get("MACH_MUKKE_API_KEY", "")
 MUSIC_DIR = Path.home() / "Music" / "mach_mukke"
 MPD_MUSIC_DIR = Path.home() / "Music"
-POLL_INTERVAL = 30
 
 
 def load_known_files() -> set[str]:
@@ -98,10 +97,7 @@ class PlayerClientApp(App):
         self.log_line(f"Connecting to {SERVER_URL}")
         await self.fetch_wishing_state()
         self.action_help()
-        self.tasks = [
-            asyncio.create_task(self.sse_listener()),
-            asyncio.create_task(self.poll_fallback()),
-        ]
+        self.tasks = [asyncio.create_task(self.sse_listener())]
 
     async def on_unmount(self) -> None:
         for task in self.tasks:
@@ -256,27 +252,10 @@ class PlayerClientApp(App):
         try:
             self.client = httpx.AsyncClient(base_url=SERVER_URL, timeout=60.0)
             await self.fetch_wishing_state()
-            self.tasks = [
-                asyncio.create_task(self.sse_listener()),
-                asyncio.create_task(self.poll_fallback()),
-            ]
+            self.tasks = [asyncio.create_task(self.sse_listener())]
             self.log_line("Reconnect tasks started.", "green")
         except Exception as e:
             self.log_line(f"Reconnect failed: {e}", "red")
-
-    async def poll_new_downloads(self) -> list[str]:
-        assert self.client is not None
-        resp = await self.client.get("/api/downloads", headers={"X-API-Key": API_KEY})
-        resp.raise_for_status()
-        downloads = resp.json()
-
-        new_files = []
-        for d in downloads:
-            filename = d["filename"]
-            if filename not in self.known_files:
-                new_files.append(filename)
-
-        return new_files
 
     async def download_file(self, filename: str) -> Path:
         assert self.client is not None
@@ -363,25 +342,6 @@ class PlayerClientApp(App):
                 self.log_line(f"SSE error ({e}), retrying in {delay}s...", "yellow")
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
-
-    async def poll_fallback(self) -> None:
-        while True:
-            try:
-                new_files = await self.poll_new_downloads()
-                for filename in new_files:
-                    self.log_line(f"Downloading (poll): {filename}")
-                    try:
-                        filepath = await self.download_file(filename)
-                        self.known_files.add(filename)
-                        await self.add_to_rmpc(filepath)
-                    except Exception as e:
-                        self.log_line(f"Failed to download {filename}: {e}", "red")
-            except httpx.RequestError as e:
-                self.log_line(f"Connection error: {e}", "yellow")
-            except Exception as e:
-                self.log_line(f"Error: {e}", "yellow")
-
-            await asyncio.sleep(POLL_INTERVAL)
 
     async def read_rmpc_queue(self) -> list[dict[str, str]]:
         try:

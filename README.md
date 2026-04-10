@@ -6,7 +6,7 @@ Interactive music making system. Submit music wishes via web interface, and they
 
 - **Server**: FastAPI app that receives music wishes, downloads them via yt-dlp, and hosts the web frontend
 - **Web Client**: Browser-based UI to submit and track music wishes
-- **Player Client**: Polls the server for new downloads and adds them to rmpc queue
+- **Player Client**: Listens via SSE for completed downloads and adds them to rmpc queue
 - **API Key**: Can be used by the player client to submit wishes without the cookie login
 
 ## Setup
@@ -44,7 +44,7 @@ export MACH_MUKKE_SERVER_URL="http://your-server:8000"
 uv run src/mach_mukke/player_client.py
 ```
 
-The client opens a TUI that polls for new downloads, saves them to `~/Music/mach_mukke`, and adds them to the rmpc queue. It also shows whether wishing is currently enabled and supports `togglewishing` to switch that state (API key required). `togglewishing` gates the web UI/cookie flow; API-key clients (like the TUI) can still submit wishes. Use the `similar` command to fetch similar tracks for the current rmpc queue.
+The client opens a TUI that listens for download completion events via SSE, saves files to `~/Music/mach_mukke`, and adds them to the rmpc queue. It also shows whether wishing is currently enabled and supports `togglewishing` to switch that state (API key required). `togglewishing` gates the web UI/cookie flow; API-key clients (like the TUI) can still submit wishes. Use the `similar` command to fetch similar tracks for the current rmpc queue.
 
 ## Requirements
 
