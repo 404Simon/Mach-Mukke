@@ -2,19 +2,17 @@ import asyncio
 import hashlib
 import hmac
 import logging
-import re
 import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import pylast
 import uvicorn
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-from mach_mukke import downloader
+from mach_mukke import downloader, similarity
 from mach_mukke.config import (
     API_KEY,
     BIRTHDAY_AGE,
@@ -80,32 +78,6 @@ def verify_cookie(cookie: str | None) -> bool:
         COOKIE_SECRET.encode(), payload.encode(), hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(sig, expected)
-
-
-def normalize_track_key(artist: str, title: str) -> str:
-    return f"{normalize_artist(artist)} - {normalize_title(title)}"
-
-
-def normalize_artist(artist: str) -> str:
-    return artist.strip().lower()
-
-
-def normalize_title(title: str) -> str:
-    base = title.strip().lower()
-    base = base.replace("&", "and")
-    base = base.replace("/", " ")
-    base = base.replace("_", " ")
-    base = re.sub(r"\s+", " ", base)
-    base = re.sub(r"\s*\([^)]*\)", "", base)
-    base = re.sub(r"\s*\[[^]]*\]", "", base)
-    base = re.sub(r"\s*\{[^}]*\}", "", base)
-    base = re.sub(
-        r"\b(live|remaster(ed)?|remix|version|edit|mix|acoustic|mono|stereo|radio|demo|deluxe|explicit|clean)\b",
-        "",
-        base,
-    )
-    base = re.sub(r"\s+", " ", base)
-    return base.strip()
 
 
 class LoginRequest(BaseModel):
@@ -176,47 +148,6 @@ class TagQueueResponse(BaseModel):
     queued: int
     skipped: int
     tracks: list[Track]
-
-
-def clean_track_for_lookup(artist: str, title: str) -> Track:
-    cleaned_artist = artist.strip()
-    cleaned_title = title.strip()
-    if cleaned_artist:
-        prefix = f"{cleaned_artist} - "
-        if cleaned_title.lower().startswith(prefix.lower()):
-            cleaned_title = cleaned_title[len(prefix) :].strip()
-    cleaned_title = re.sub(r"\s*[\(\[].*?[\)\]]\s*", " ", cleaned_title)
-    cleaned_title = re.sub(r"\s+", " ", cleaned_title).strip()
-    return Track(artist=cleaned_artist, title=cleaned_title)
-
-
-def fetch_similar_tracks_sync(artist: str, title: str, limit: int = 3) -> list[Track]:
-    network = pylast.LastFMNetwork(api_key=LASTFM_API_KEY, api_secret=LASTFM_API_SECRET)
-    cleaned = clean_track_for_lookup(artist, title)
-    track = network.get_track(cleaned.artist, cleaned.title)
-    results: list[Track] = []
-    try:
-        similar_items = track.get_similar(limit=limit, autocorrect=True)
-    except TypeError:
-        similar_items = track.get_similar(limit=limit)
-    for item in similar_items:
-        similar = item.item
-        results.append(Track(artist=similar.artist.name, title=similar.title))
-    return results
-
-
-def fetch_tag_top_tracks_sync(tag: str, limit: int = 10) -> list[Track]:
-    network = pylast.LastFMNetwork(api_key=LASTFM_API_KEY, api_secret=LASTFM_API_SECRET)
-    tag_obj = network.get_tag(tag)
-    results: list[Track] = []
-    try:
-        top_items = tag_obj.get_top_tracks(limit=limit)
-    except TypeError:
-        top_items = tag_obj.get_top_tracks(limit=limit)
-    for item in top_items:
-        track = item.item
-        results.append(Track(artist=track.artist.name, title=track.title))
-    return results
 
 
 @app.get("/")
@@ -294,17 +225,29 @@ async def find_similar_tracks(body: SimilarRequest, _=Depends(verify_api_key)):
             status_code=500, detail="Last.fm API key/secret not configured on server"
         )
 
-    source_tracks = [
-        clean_track_for_lookup(t.artist, t.title)
-        for t in body.tracks
-        if t.artist.strip() and t.title.strip()
-    ]
+    source_tracks: list[Track] = []
+    for incoming in body.tracks:
+        if not incoming.artist.strip() or not incoming.title.strip():
+            continue
+        artist, title = similarity.clean_track_for_lookup(
+            incoming.artist, incoming.title
+        )
+        if artist and title:
+            source_tracks.append(Track(artist=artist, title=title))
+
     if not source_tracks:
         raise HTTPException(status_code=400, detail="No valid tracks provided")
 
     results = await asyncio.gather(
         *[
-            asyncio.to_thread(fetch_similar_tracks_sync, track.artist, track.title, 3)
+            asyncio.to_thread(
+                similarity.fetch_similar_tracks_sync,
+                track.artist,
+                track.title,
+                LASTFM_API_KEY,
+                LASTFM_API_SECRET,
+                3,
+            )
             for track in source_tracks
         ],
         return_exceptions=True,
@@ -312,16 +255,19 @@ async def find_similar_tracks(body: SimilarRequest, _=Depends(verify_api_key)):
 
     similar: list[Track] = []
     for result in results:
-        if isinstance(result, Exception):
+        if isinstance(result, BaseException):
             logger.warning("Similar track lookup failed: %s", result)
             continue
-        similar.extend(result)
+        for artist, title in result:
+            similar.append(Track(artist=artist, title=title))
 
-    source_keys = {normalize_track_key(t.artist, t.title) for t in source_tracks}
+    source_keys = {
+        similarity.normalize_track_key(t.artist, t.title) for t in source_tracks
+    }
     seen: set[str] = set()
     unique: list[Track] = []
     for track in similar:
-        key = normalize_track_key(track.artist, track.title)
+        key = similarity.normalize_track_key(track.artist, track.title)
         if key in seen or key in source_keys:
             continue
         seen.add(key)
@@ -332,12 +278,15 @@ async def find_similar_tracks(body: SimilarRequest, _=Depends(verify_api_key)):
         query = task["query"]
         if " - " in query:
             artist, title = query.split(" - ", 1)
-            existing_queries.add(normalize_track_key(artist, title))
+            existing_queries.add(similarity.normalize_track_key(artist, title))
     queued = 0
     skipped = 0
     for track in unique:
         query = f"{track.artist} - {track.title}"
-        if normalize_track_key(track.artist, track.title) in existing_queries:
+        if (
+            similarity.normalize_track_key(track.artist, track.title)
+            in existing_queries
+        ):
             skipped += 1
             continue
         await enqueue_download(query)
@@ -354,34 +303,45 @@ async def queue_tag_top_tracks(tag: str, limit: int = 15, _=Depends(verify_api_k
         )
     safe_limit = max(1, min(limit, 50))
     try:
-        tracks = await asyncio.to_thread(fetch_tag_top_tracks_sync, tag, safe_limit)
+        result_tracks = await asyncio.to_thread(
+            similarity.fetch_tag_top_tracks_sync,
+            tag,
+            LASTFM_API_KEY,
+            LASTFM_API_SECRET,
+            safe_limit,
+        )
     except Exception as e:
         logger.warning("Tag lookup failed: %s", e)
         raise HTTPException(status_code=502, detail="Tag lookup failed") from e
 
-    if not tracks:
+    if not result_tracks:
         return TagQueueResponse(queued=0, skipped=0, tracks=[])
+
+    tracks = [Track(artist=artist, title=title) for artist, title in result_tracks]
 
     existing_queries: set[str] = set()
     for task in download_tasks.values():
         query = task["query"]
         if " - " in query:
             artist, title = query.split(" - ", 1)
-            existing_queries.add(normalize_track_key(artist, title))
+            existing_queries.add(similarity.normalize_track_key(artist, title))
 
     queued = 0
     skipped = 0
     unique: list[Track] = []
     seen: set[str] = set()
     for track in tracks:
-        key = normalize_track_key(track.artist, track.title)
+        key = similarity.normalize_track_key(track.artist, track.title)
         if key in seen:
             continue
         seen.add(key)
         unique.append(track)
 
     for track in unique:
-        if normalize_track_key(track.artist, track.title) in existing_queries:
+        if (
+            similarity.normalize_track_key(track.artist, track.title)
+            in existing_queries
+        ):
             skipped += 1
             continue
         await enqueue_download(f"{track.artist} - {track.title}")

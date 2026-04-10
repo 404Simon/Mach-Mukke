@@ -376,6 +376,16 @@ class PlayerClientApp(App):
                     meta = item.get("metadata") or {}
                     artist = (meta.get("artist") or "").strip()
                     title = (meta.get("title") or "").strip()
+                    if not title:
+                        title = (item.get("name") or "").strip()
+                    if not artist:
+                        artist = (item.get("artist") or "").strip()
+
+                    if not artist and " - " in title:
+                        guessed_artist, guessed_title = title.split(" - ", 1)
+                        artist = guessed_artist.strip()
+                        title = guessed_title.strip()
+
                     if (
                         artist
                         and title
