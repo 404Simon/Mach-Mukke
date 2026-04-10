@@ -6,12 +6,19 @@
     <title>Mach Mukke - Musikwünsche</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
+        html {
+            min-height: 100%;
+            background: #0f3460;
+        }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            background-repeat: no-repeat;
             min-height: 100vh;
+            min-height: 100dvh;
             color: #e0e0e0;
             padding: 2rem;
+            overscroll-behavior-y: none;
         }
         .container { max-width: 600px; margin: 0 auto; }
         h1 {
@@ -149,6 +156,51 @@
         }
         .toast.show { transform: translateX(-50%) translateY(0); }
         .hidden { display: none !important; }
+
+        @media (max-width: 640px) {
+            body {
+                padding: 1rem;
+            }
+            h1 {
+                font-size: 2rem;
+                margin-bottom: 1.5rem;
+            }
+            .login-form, .wish-form {
+                padding: 1.25rem;
+                border-radius: 14px;
+                margin-bottom: 1.25rem;
+            }
+            .input-group {
+                flex-direction: column;
+                gap: 0.75rem;
+            }
+            input[type="text"],
+            .login-field input,
+            button,
+            .login-btn {
+                width: 100%;
+                min-height: 48px;
+                padding: 0.85rem 1rem;
+            }
+            .wish-item {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 0.5rem;
+                padding: 1rem;
+            }
+            .toast {
+                left: 1rem;
+                right: 1rem;
+                bottom: 1rem;
+                width: auto;
+                transform: translateY(100px);
+                text-align: center;
+                padding: 0.85rem 1rem;
+            }
+            .toast.show {
+                transform: translateY(0);
+            }
+        }
     </style>
 </head>
 <body>
