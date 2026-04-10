@@ -119,11 +119,11 @@ class PlayerClientApp(App):
 
     def action_help(self) -> None:
         self.log_line(
-            "Commands: wish <query> | similar [limit] | tag <tag> [limit] | wishing | togglewishing | reconnect | help | quit",
+            "Commands: wish <query> | similar [song] [limit] | tag <tag> [limit] | wishing | togglewishing | reconnect | help | quit",
             "cyan",
         )
         self.log_line(
-            "similar [limit] -> fetch similar tracks for the current rmpc queue",
+            "similar [song] [limit] -> for queue when no song, or for a given song query",
             "cyan",
         )
         self.log_line("wish <query> -> submit a download wish", "cyan")
@@ -159,13 +159,25 @@ class PlayerClientApp(App):
                 await self.submit_wish(" ".join(parts[1:]))
         elif cmd in {"similar", "sim"}:
             limit = 3
-            if len(parts) >= 2:
-                if parts[1].isdigit():
-                    limit = int(parts[1])
-                else:
-                    self.log_line("Usage: similar [limit]", "yellow")
-                    return
-            await self.request_similar_tracks(limit)
+            if len(parts) == 1:
+                await self.request_similar_tracks(limit)
+                return
+
+            if parts[-1].isdigit():
+                limit = int(parts[-1])
+                song_parts = parts[1:-1]
+            else:
+                song_parts = parts[1:]
+
+            if not song_parts:
+                await self.request_similar_tracks(limit)
+                return
+
+            song_query = " ".join(song_parts).strip()
+            if not song_query:
+                self.log_line("Usage: similar [song] [limit]", "yellow")
+                return
+            await self.request_similar_for_query(song_query, limit)
         elif cmd in {"tag", "search"}:
             if len(parts) < 2:
                 self.log_line("Usage: tag <tag> [limit]", "yellow")
@@ -445,6 +457,39 @@ class PlayerClientApp(App):
                     f"{t.get('artist')} - {t.get('title')}" for t in returned[:5]
                 )
                 self.log_line(f"Similar preview: {preview}", "cyan")
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text if e.response else str(e)
+            self.log_line(f"Similar request failed: {detail}", "red")
+        except Exception as e:
+            self.log_line(f"Similar request error: {e}", "red")
+
+    async def request_similar_for_query(self, query: str, limit: int = 3) -> None:
+        if not self.client:
+            return
+        safe_limit = max(1, min(limit, 50))
+        self.log_line(f"Requesting {safe_limit} similar tracks for: {query}")
+        try:
+            resp = await self.client.post(
+                "/api/similar",
+                headers={"X-API-Key": API_KEY},
+                json={"query": query, "limit": safe_limit},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            queued = payload.get("queued", 0)
+            skipped = payload.get("skipped", 0)
+            returned = payload.get("tracks", [])
+            self.log_line(
+                f"Similar tracks queued: {queued} (skipped: {skipped}, found: {len(returned)})",
+                "green",
+            )
+            if not returned:
+                self.log_line(f"No similar tracks found for: {query}", "yellow")
+                return
+            preview = ", ".join(
+                f"{t.get('artist')} - {t.get('title')}" for t in returned[:5]
+            )
+            self.log_line(f"Similar preview: {preview}", "cyan")
         except httpx.HTTPStatusError as e:
             detail = e.response.text if e.response else str(e)
             self.log_line(f"Similar request failed: {detail}", "red")

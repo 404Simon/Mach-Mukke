@@ -192,6 +192,63 @@ def _merge_tracks(
         target.append((artist, title))
 
 
+def resolve_tracks_from_query_sync(
+    query: str, api_key: str, limit: int = 5
+) -> list[tuple[str, str]]:
+    cleaned_query = query.strip()
+    if not cleaned_query:
+        return []
+
+    seen: set[str] = set()
+    resolved: list[tuple[str, str]] = []
+    _merge_tracks(
+        resolved,
+        seen,
+        _search_tracks_from_api(cleaned_query, max(1, min(limit, 50)), api_key),
+    )
+    return resolved
+
+
+def fetch_similar_tracks_for_query_sync(
+    query: str,
+    api_key: str,
+    api_secret: str,
+    limit: int = 3,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    safe_limit = max(1, min(limit, 50))
+    source_tracks = resolve_tracks_from_query_sync(query, api_key, limit=5)
+    if not source_tracks:
+        return [], []
+
+    fetch_limit = max(6, safe_limit * 4)
+    seen: set[str] = set()
+    merged: list[tuple[str, str]] = []
+    for artist, title in source_tracks:
+        _merge_tracks(
+            merged,
+            seen,
+            fetch_similar_tracks_sync(
+                artist,
+                title,
+                api_key,
+                api_secret,
+                fetch_limit,
+            ),
+        )
+        if len(merged) >= safe_limit:
+            break
+
+    source_keys = {
+        normalize_track_key(artist, title) for artist, title in source_tracks
+    }
+    filtered = [
+        (artist, title)
+        for artist, title in merged
+        if normalize_track_key(artist, title) not in source_keys
+    ]
+    return filtered[:safe_limit], source_tracks
+
+
 def fetch_similar_tracks_sync(
     artist: str,
     title: str,

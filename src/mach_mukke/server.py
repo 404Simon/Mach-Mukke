@@ -135,7 +135,8 @@ class Track(BaseModel):
 
 
 class SimilarRequest(BaseModel):
-    tracks: list[Track]
+    tracks: list[Track] = []
+    query: str | None = None
     limit: int = 3
 
 
@@ -228,43 +229,67 @@ async def find_similar_tracks(body: SimilarRequest, _=Depends(verify_api_key)):
             status_code=500, detail="Last.fm API key/secret not configured on server"
         )
 
-    source_tracks: list[Track] = []
-    for incoming in body.tracks:
-        if not incoming.artist.strip() or not incoming.title.strip():
-            continue
-        artist, title = similarity.clean_track_for_lookup(
-            incoming.artist, incoming.title
-        )
-        if artist and title:
-            source_tracks.append(Track(artist=artist, title=title))
-
-    if not source_tracks:
-        raise HTTPException(status_code=400, detail="No valid tracks provided")
-
     safe_limit = max(1, min(body.limit, 50))
 
-    results = await asyncio.gather(
-        *[
-            asyncio.to_thread(
-                similarity.fetch_similar_tracks_sync,
-                track.artist,
-                track.title,
+    source_tracks: list[Track] = []
+    similar: list[Track] = []
+
+    if body.query and body.query.strip():
+        try:
+            query_results, query_sources = await asyncio.to_thread(
+                similarity.fetch_similar_tracks_for_query_sync,
+                body.query,
                 LASTFM_API_KEY,
                 LASTFM_API_SECRET,
                 safe_limit,
             )
-            for track in source_tracks
-        ],
-        return_exceptions=True,
-    )
+        except Exception as e:
+            logger.warning("Similar query lookup failed: %s", e)
+            raise HTTPException(
+                status_code=502, detail="Similar track lookup failed"
+            ) from e
 
-    similar: list[Track] = []
-    for result in results:
-        if isinstance(result, BaseException):
-            logger.warning("Similar track lookup failed: %s", result)
-            continue
-        for artist, title in result:
-            similar.append(Track(artist=artist, title=title))
+        source_tracks = [
+            Track(artist=artist, title=title) for artist, title in query_sources
+        ]
+        similar = [Track(artist=artist, title=title) for artist, title in query_results]
+    else:
+        for incoming in body.tracks:
+            if not incoming.artist.strip() or not incoming.title.strip():
+                continue
+            artist, title = similarity.clean_track_for_lookup(
+                incoming.artist, incoming.title
+            )
+            if artist and title:
+                source_tracks.append(Track(artist=artist, title=title))
+
+        if not source_tracks:
+            raise HTTPException(
+                status_code=400,
+                detail="No valid tracks provided or query missing",
+            )
+
+        results = await asyncio.gather(
+            *[
+                asyncio.to_thread(
+                    similarity.fetch_similar_tracks_sync,
+                    track.artist,
+                    track.title,
+                    LASTFM_API_KEY,
+                    LASTFM_API_SECRET,
+                    safe_limit,
+                )
+                for track in source_tracks
+            ],
+            return_exceptions=True,
+        )
+
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning("Similar track lookup failed: %s", result)
+                continue
+            for artist, title in result:
+                similar.append(Track(artist=artist, title=title))
 
     source_keys = {
         similarity.normalize_track_key(t.artist, t.title) for t in source_tracks
