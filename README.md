@@ -23,6 +23,8 @@ uv sync
 export MACH_MUKKE_API_KEY="your-secret-key"
 export MACH_MUKKE_LASTFM_API_KEY="your-lastfm-key"
 export MACH_MUKKE_LASTFM_API_SECRET="your-lastfm-secret"
+# optional: default is false (wishing disabled)
+export MACH_MUKKE_WISHING_ENABLED="false"
 uv run src/mach_mukke/server.py
 ```
 
@@ -42,7 +44,7 @@ export MACH_MUKKE_SERVER_URL="http://your-server:8000"
 uv run src/mach_mukke/player_client.py
 ```
 
-The client opens a TUI that polls for new downloads, saves them to `~/Music/mach_mukke`, and adds them to the rmpc queue. Use the `similar` command to fetch similar tracks for the current rmpc queue.
+The client opens a TUI that polls for new downloads, saves them to `~/Music/mach_mukke`, and adds them to the rmpc queue. It also shows whether wishing is currently enabled and supports `togglewishing` to switch that state (API key required). `togglewishing` gates the web UI/cookie flow; API-key clients (like the TUI) can still submit wishes. Use the `similar` command to fetch similar tracks for the current rmpc queue.
 
 ## Requirements
 

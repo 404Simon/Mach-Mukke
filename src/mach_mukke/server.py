@@ -2,16 +2,18 @@ import asyncio
 import hashlib
 import hmac
 import logging
-import secrets
 import re
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pylast
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Header, Response
+import uvicorn
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Response
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
+from mach_mukke import downloader
 from mach_mukke.config import (
     API_KEY,
     BIRTHDAY_AGE,
@@ -21,6 +23,7 @@ from mach_mukke.config import (
     LASTFM_API_KEY,
     LASTFM_API_SECRET,
     TMP_DIR,
+    WISHING_ENABLED_DEFAULT,
 )
 from mach_mukke.downloader import (
     apply_r128_track_gain,
@@ -31,13 +34,15 @@ from mach_mukke.downloader import (
     sanitize_filename,
     validate_opus,
 )
-from mach_mukke import downloader
-from mach_mukke.sse import create_subscriber, notify as notify_sse, sse_generator
+from mach_mukke.sse import create_subscriber
+from mach_mukke.sse import notify as notify_sse
+from mach_mukke.sse import sse_generator
 
 logger = logging.getLogger("mach_mukke.server")
 
 download_queue: asyncio.Queue = asyncio.Queue()
 download_tasks: dict[str, dict] = {}
+wishing_enabled = WISHING_ENABLED_DEFAULT
 
 
 @asynccontextmanager
@@ -114,11 +119,12 @@ def require_auth(mukke_auth: str | None = Cookie(default=None)):
 def require_auth_or_api_key(
     mukke_auth: str | None = Cookie(default=None),
     x_api_key: str | None = Header(default=None),
-):
+) -> bool:
     if x_api_key == API_KEY:
-        return
+        return True
     if not verify_cookie(mukke_auth):
         raise HTTPException(status_code=401, detail="Nicht angemeldet")
+    return False
 
 
 async def enqueue_download(query: str) -> str:
@@ -143,6 +149,10 @@ class WishStatus(BaseModel):
     status: str
     filename: str | None = None
     error: str | None = None
+
+
+class WishingState(BaseModel):
+    enabled: bool
 
 
 class Track(BaseModel):
@@ -179,9 +189,7 @@ def clean_track_for_lookup(artist: str, title: str) -> Track:
 
 
 def fetch_similar_tracks_sync(artist: str, title: str, limit: int = 3) -> list[Track]:
-    network = pylast.LastFMNetwork(
-        api_key=LASTFM_API_KEY, api_secret=LASTFM_API_SECRET
-    )
+    network = pylast.LastFMNetwork(api_key=LASTFM_API_KEY, api_secret=LASTFM_API_SECRET)
     cleaned = clean_track_for_lookup(artist, title)
     track = network.get_track(cleaned.artist, cleaned.title)
     results: list[Track] = []
@@ -196,9 +204,7 @@ def fetch_similar_tracks_sync(artist: str, title: str, limit: int = 3) -> list[T
 
 
 def fetch_tag_top_tracks_sync(tag: str, limit: int = 10) -> list[Track]:
-    network = pylast.LastFMNetwork(
-        api_key=LASTFM_API_KEY, api_secret=LASTFM_API_SECRET
-    )
+    network = pylast.LastFMNetwork(api_key=LASTFM_API_KEY, api_secret=LASTFM_API_SECRET)
     tag_obj = network.get_tag(tag)
     results: list[Track] = []
     try:
@@ -213,9 +219,24 @@ def fetch_tag_top_tracks_sync(tag: str, limit: int = 10) -> list[Track]:
 
 @app.get("/")
 async def index():
+    if not wishing_enabled:
+        return FileResponse(str(Path(__file__).parent / "static" / "disabled.html"))
     return HTMLResponse(
         content=(Path(__file__).parent / "static" / "index.html").read_text()
     )
+
+
+@app.get("/api/wishing", response_model=WishingState)
+async def get_wishing_state():
+    return WishingState(enabled=wishing_enabled)
+
+
+@app.post("/api/wishing/toggle", response_model=WishingState)
+async def toggle_wishing(_=Depends(verify_api_key)):
+    global wishing_enabled
+    wishing_enabled = not wishing_enabled
+    logger.info("Wishing toggled. Enabled=%s", wishing_enabled)
+    return WishingState(enabled=wishing_enabled)
 
 
 @app.get("/api/auth")
@@ -242,7 +263,11 @@ async def login(body: LoginRequest, response: Response):
 
 
 @app.post("/api/wish")
-async def submit_wish(wish: WishRequest, _=Depends(require_auth_or_api_key)):
+async def submit_wish(
+    wish: WishRequest, is_api_key_client: bool = Depends(require_auth_or_api_key)
+):
+    if not wishing_enabled and not is_api_key_client:
+        raise HTTPException(status_code=403, detail="Wishing is currently disabled")
     wish_id = await enqueue_download(wish.query)
     return {"id": wish_id, "status": "queued"}
 
@@ -277,9 +302,7 @@ async def find_similar_tracks(body: SimilarRequest, _=Depends(verify_api_key)):
 
     results = await asyncio.gather(
         *[
-            asyncio.to_thread(
-                fetch_similar_tracks_sync, track.artist, track.title, 3
-            )
+            asyncio.to_thread(fetch_similar_tracks_sync, track.artist, track.title, 3)
             for track in source_tracks
         ],
         return_exceptions=True,
@@ -485,8 +508,6 @@ async def process_downloads():
 
 
 def main():
-    import uvicorn
-
     logging.basicConfig(level=logging.INFO)
     print(f"API Key: {API_KEY}")
     print("Set MACH_MUKKE_API_KEY env var for the player client")

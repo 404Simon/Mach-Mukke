@@ -7,11 +7,11 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.widgets import Footer, Header, Input, RichLog
-from rich.text import Text
 
 SERVER_URL = os.environ.get("MACH_MUKKE_SERVER_URL", "http://localhost:8000")
 API_KEY = os.environ.get("MACH_MUKKE_API_KEY", "")
@@ -80,6 +80,7 @@ class PlayerClientApp(App):
         self.client: httpx.AsyncClient | None = None
         self.known_files: set[str] = load_known_files()
         self.tasks: list[asyncio.Task] = []
+        self.wishing_enabled: bool | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -95,6 +96,7 @@ class PlayerClientApp(App):
         self.client = httpx.AsyncClient(base_url=SERVER_URL, timeout=60.0)
         self.log_line(f"Known files: {len(self.known_files)} in {MUSIC_DIR}")
         self.log_line(f"Connecting to {SERVER_URL}")
+        await self.fetch_wishing_state()
         self.action_help()
         self.tasks = [
             asyncio.create_task(self.sse_listener()),
@@ -121,16 +123,16 @@ class PlayerClientApp(App):
 
     def action_help(self) -> None:
         self.log_line(
-            "Commands: wish <query> | similar | tag <tag> [limit] | reconnect | help | quit",
+            "Commands: wish <query> | similar | tag <tag> [limit] | wishing | togglewishing | reconnect | help | quit",
             "cyan",
         )
         self.log_line(
             "similar -> fetch similar tracks for the current rmpc queue", "cyan"
         )
         self.log_line("wish <query> -> submit a download wish", "cyan")
-        self.log_line(
-            "tag <tag> [limit] -> queue top tracks for a Last.fm tag", "cyan"
-        )
+        self.log_line("tag <tag> [limit] -> queue top tracks for a Last.fm tag", "cyan")
+        self.log_line("wishing -> show current wishing state", "cyan")
+        self.log_line("togglewishing -> toggle wishing on the server", "cyan")
         self.log_line("reconnect -> restart server connection tasks", "cyan")
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -174,6 +176,10 @@ class PlayerClientApp(App):
                     self.log_line("Usage: tag <tag> [limit]", "yellow")
                 else:
                     await self.request_tag_top_tracks(tag, limit)
+        elif cmd in {"wishing", "wishstate", "ws"}:
+            await self.fetch_wishing_state()
+        elif cmd in {"togglewishing", "togglewish", "tw"}:
+            await self.toggle_wishing()
         elif cmd in {"reconnect", "reconn"}:
             await self.reconnect()
         else:
@@ -199,6 +205,46 @@ class PlayerClientApp(App):
         except Exception as e:
             self.log_line(f"Wish error: {e}", "red")
 
+    def log_wishing_state(self) -> None:
+        if self.wishing_enabled is None:
+            self.log_line("Wishing: unknown", "yellow")
+            return
+        state = "enabled" if self.wishing_enabled else "disabled"
+        style = "green" if self.wishing_enabled else "yellow"
+        self.log_line(f"Wishing: {state}", style)
+
+    async def fetch_wishing_state(self) -> None:
+        if not self.client:
+            return
+        try:
+            resp = await self.client.get("/api/wishing")
+            resp.raise_for_status()
+            payload = resp.json()
+            self.wishing_enabled = bool(payload.get("enabled", False))
+            self.log_wishing_state()
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text if e.response else str(e)
+            self.log_line(f"Failed to read wishing state: {detail}", "red")
+        except Exception as e:
+            self.log_line(f"Wishing state error: {e}", "red")
+
+    async def toggle_wishing(self) -> None:
+        if not self.client:
+            return
+        try:
+            resp = await self.client.post(
+                "/api/wishing/toggle", headers={"X-API-Key": API_KEY}
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            self.wishing_enabled = bool(payload.get("enabled", False))
+            self.log_wishing_state()
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text if e.response else str(e)
+            self.log_line(f"Failed to toggle wishing: {detail}", "red")
+        except Exception as e:
+            self.log_line(f"Toggle wishing error: {e}", "red")
+
     async def reconnect(self) -> None:
         for task in self.tasks:
             task.cancel()
@@ -209,6 +255,7 @@ class PlayerClientApp(App):
         self.log_line("Reconnecting...", "yellow")
         try:
             self.client = httpx.AsyncClient(base_url=SERVER_URL, timeout=60.0)
+            await self.fetch_wishing_state()
             self.tasks = [
                 asyncio.create_task(self.sse_listener()),
                 asyncio.create_task(self.poll_fallback()),
@@ -346,9 +393,7 @@ class PlayerClientApp(App):
             )
             stdout, stderr = await proc.communicate()
             if proc.returncode != 0:
-                self.log_line(
-                    f"rmpc queue failed: {stderr.decode().strip()}", "red"
-                )
+                self.log_line(f"rmpc queue failed: {stderr.decode().strip()}", "red")
                 return []
             output = stdout.decode()
             payload = None
@@ -371,7 +416,11 @@ class PlayerClientApp(App):
                     meta = item.get("metadata") or {}
                     artist = (meta.get("artist") or "").strip()
                     title = (meta.get("title") or "").strip()
-                    if artist and title and title.lower().startswith(artist.lower() + " - "):
+                    if (
+                        artist
+                        and title
+                        and title.lower().startswith(artist.lower() + " - ")
+                    ):
                         title = title[len(artist) + 3 :].strip()
                     if artist and title:
                         tracks.append({"artist": artist, "title": title})
@@ -407,7 +456,9 @@ class PlayerClientApp(App):
                 "green",
             )
             if not returned:
-                self.log_line("No similar tracks found for the current queue.", "yellow")
+                self.log_line(
+                    "No similar tracks found for the current queue.", "yellow"
+                )
             else:
                 preview = ", ".join(
                     f"{t.get('artist')} - {t.get('title')}" for t in returned[:5]
