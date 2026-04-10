@@ -207,7 +207,9 @@ async def submit_wish(
 
 
 @app.get("/api/wish/{wish_id}")
-async def get_wish_status(wish_id: str):
+async def get_wish_status(
+    wish_id: str, _is_api_key_client: bool = Depends(require_auth_or_api_key)
+):
     if wish_id not in download_tasks:
         raise HTTPException(status_code=404, detail="Wish not found")
     task = download_tasks[wish_id]
@@ -215,7 +217,7 @@ async def get_wish_status(wish_id: str):
 
 
 @app.get("/api/wishes")
-async def list_wishes():
+async def list_wishes(_is_api_key_client: bool = Depends(require_auth_or_api_key)):
     return [WishStatus(id=wish_id, **task) for wish_id, task in download_tasks.items()]
 
 

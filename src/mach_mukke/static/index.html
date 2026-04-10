@@ -222,6 +222,7 @@
                 loginForm.classList.add('hidden');
                 wishFormContainer.classList.remove('hidden');
                 wishesList.classList.remove('hidden');
+                startWishPolling();
                 refreshWishes();
             } catch (err) {
                 showToast('Fehler beim Anmelden!', true);
@@ -239,6 +240,7 @@
                     loginForm.classList.add('hidden');
                     wishFormContainer.classList.remove('hidden');
                     wishesList.classList.remove('hidden');
+                    startWishPolling();
                     refreshWishes();
                 }
             } catch (err) {}
@@ -277,8 +279,15 @@
         });
 
         async function refreshWishes() {
+            if (!authenticated) return;
             try {
                 const res = await fetch('/api/wishes');
+                if (!res.ok) {
+                    if (res.status === 401) {
+                        authenticated = false;
+                    }
+                    return;
+                }
                 const data = await res.json();
                 for (const wish of data) {
                     wishes[wish.id] = wish;
@@ -326,7 +335,14 @@
             setTimeout(() => toast.classList.remove('show'), 3000);
         }
 
-        setInterval(refreshWishes, 2000);
+        const wishPollIntervalMs = 2000;
+        let wishPollTimer = null;
+
+        function startWishPolling() {
+            if (wishPollTimer !== null) return;
+            wishPollTimer = setInterval(refreshWishes, wishPollIntervalMs);
+        }
+
         checkAuth();
     </script>
 </body>
