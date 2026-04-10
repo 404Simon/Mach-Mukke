@@ -2,7 +2,9 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import math
 import secrets
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -22,6 +24,8 @@ from mach_mukke.config import (
     LASTFM_API_KEY,
     LASTFM_API_SECRET,
     TMP_DIR,
+    WISH_RATE_LIMIT_COUNT,
+    WISH_RATE_LIMIT_WINDOW_SECONDS,
     WISHING_ENABLED_DEFAULT,
 )
 from mach_mukke.downloader import (
@@ -42,6 +46,15 @@ logger = logging.getLogger("mach_mukke.server")
 download_queue: asyncio.Queue = asyncio.Queue()
 download_tasks: dict[str, dict] = {}
 wishing_enabled = WISHING_ENABLED_DEFAULT
+wish_rate_limits: dict[str, list[float]] = {}
+
+
+def clamp_non_negative(value: int) -> int:
+    return max(0, value)
+
+
+wish_rate_limit_count = clamp_non_negative(WISH_RATE_LIMIT_COUNT)
+wish_rate_limit_window_seconds = clamp_non_negative(WISH_RATE_LIMIT_WINDOW_SECONDS)
 
 
 @asynccontextmanager
@@ -199,10 +212,49 @@ async def login(body: LoginRequest, response: Response):
 
 @app.post("/api/wish")
 async def submit_wish(
-    wish: WishRequest, is_api_key_client: bool = Depends(require_auth_or_api_key)
+    wish: WishRequest,
+    response: Response,
+    mukke_sid: str | None = Cookie(default=None),
+    is_api_key_client: bool = Depends(require_auth_or_api_key),
 ):
     if not wishing_enabled and not is_api_key_client:
         raise HTTPException(status_code=403, detail="Wishing is currently disabled")
+
+    if (
+        not is_api_key_client
+        and wish_rate_limit_count > 0
+        and wish_rate_limit_window_seconds > 0
+    ):
+        now = time.time()
+        window_start = now - wish_rate_limit_window_seconds
+        rate_limit_id = mukke_sid or secrets.token_hex(16)
+        timestamps = wish_rate_limits.get(rate_limit_id, [])
+        timestamps = [ts for ts in timestamps if ts >= window_start]
+
+        if len(timestamps) >= wish_rate_limit_count:
+            retry_after = max(
+                1, math.ceil(min(timestamps) + wish_rate_limit_window_seconds - now)
+            )
+            headers = {"Retry-After": str(retry_after)}
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Rate limit exceeded: max {wish_rate_limit_count} wishes per "
+                    f"{wish_rate_limit_window_seconds} seconds"
+                ),
+                headers=headers,
+            )
+
+        timestamps.append(now)
+        wish_rate_limits[rate_limit_id] = timestamps
+        response.set_cookie(
+            key="mukke_sid",
+            value=rate_limit_id,
+            httponly=True,
+            samesite="lax",
+            max_age=30 * 24 * 60 * 60,  # 30 days
+        )
+
     wish_id = await enqueue_download(wish.query)
     return {"id": wish_id, "status": "queued"}
 

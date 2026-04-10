@@ -16,3 +16,8 @@ WISHING_ENABLED_DEFAULT = os.environ.get(
 BIRTHDAY_NAME = os.environ.get("BIRTHDAY_NAME", "Mustermann")
 BIRTHDAY_AGE = os.environ.get("BIRTHDAY_AGE", "999")
 COOKIE_SECRET = os.environ.get("COOKIE_SECRET", secrets.token_hex(32))
+
+WISH_RATE_LIMIT_COUNT = int(os.environ.get("MACH_MUKKE_WISH_RATE_LIMIT_COUNT", "10"))
+WISH_RATE_LIMIT_WINDOW_SECONDS = int(
+    os.environ.get("MACH_MUKKE_WISH_RATE_LIMIT_WINDOW_SECONDS", "3600")
+)

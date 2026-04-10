@@ -314,6 +314,17 @@
                 });
                 if (!res.ok) {
                     const data = await res.json();
+                    if (res.status === 429) {
+                        const retryAfterHeader = Number(res.headers.get('Retry-After'));
+                        const retryAfterSeconds = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
+                            ? retryAfterHeader
+                            : null;
+                        const waitText = retryAfterSeconds !== null
+                            ? formatRetryAfter(retryAfterSeconds)
+                            : 'in kurzer Zeit';
+                        showToast(`Zu viele Wünsche. Bitte versuch es ${waitText} erneut.`, true);
+                        return;
+                    }
                     showToast(data.detail || 'Fehler!', true);
                     return;
                 }
@@ -378,6 +389,14 @@
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
+        }
+
+        function formatRetryAfter(seconds) {
+            if (seconds < 60) {
+                return `in ${seconds} Sekunde${seconds === 1 ? '' : 'n'}`;
+            }
+            const minutes = Math.ceil(seconds / 60);
+            return `in ${minutes} Minute${minutes === 1 ? '' : 'n'}`;
         }
 
         function showToast(message, isError = false) {
